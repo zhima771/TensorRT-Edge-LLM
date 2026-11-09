@@ -127,6 +127,15 @@ def _is_qwen3_5_mtp_draft_supported(model_type: str) -> bool:
     return model_type in _QWEN3_5_MTP_DRAFT_MODEL_TYPES
 
 
+def _qwen4_exp_text_key_filter(key: str) -> bool:
+    """Keep the text tower only; skip vision/MTP and the n-gram table shards."""
+    if key.startswith("model.visual.") or key.startswith("mtp."):
+        return False
+    if ".ple.ple_embedding.ngram_embedding.shard_" in key:
+        return False
+    return True
+
+
 def _inherit_dspark_base_metadata(config: ModelConfig,
                                   dspark_draft_dir: "str | None") -> None:
     if not dspark_draft_dir:
@@ -228,38 +237,40 @@ class AutoModel:
     """HuggingFace-style factory that dispatches on ``model_type``."""
 
     @classmethod
-    def from_pretrained(cls,
-                        model_dir: str,
-                        device: str = "cpu",
-                        key_remap=None,
-                        key_prefix: "str | None" = None,
-                        eagle_base: bool = False,
-                        eagle_draft_dir: "str | None" = None,
-                        reduced_vocab_dir: "str | None" = None,
-                        mtp_base: bool = False,
-                        mtp_tree_base: bool = False,
-                        mtp_draft: bool = False,
-                        tp_size: int = 1,
-                        tp_rank: int = 0,
-                        dflash_base: bool = False,
-                        dflash_tree_base: bool = False,
-                        dflash_draft: bool = False,
-                        dflash_draft_dir: "str | None" = None,
-                        jetspec_base: bool = False,
-                        jetspec_tree_base: bool = False,
-                        jetspec_draft: bool = False,
-                        jetspec_draft_dir: "str | None" = None,
-                        dspark_base: bool = False,
-                        dspark_tree_base: bool = False,
-                        dspark_draft: bool = False,
-                        dspark_draft_dir: "str | None" = None,
-                        gemma4_mtp_base: bool = False,
-                        gemma4_mtp_draft: bool = False,
-                        gemma4_kv_sharing_map: "list[dict] | None" = None,
-                        gemma4_target_kv_cache_quant: "str | None" = None,
-                        num_decoder_layers: "int | None" = None,
-                        extra_configs: "dict | None" = None,
-                        low_cpu_mem_usage: bool = False) -> nn.Module:
+    def from_pretrained(
+            cls,
+            model_dir: str,
+            device: str = "cpu",
+            key_remap=None,
+            key_prefix: "str | None" = None,
+            eagle_base: bool = False,
+            eagle_draft_dir: "str | None" = None,
+            reduced_vocab_dir: "str | None" = None,
+            mtp_base: bool = False,
+            mtp_tree_base: bool = False,
+            mtp_draft: bool = False,
+            tp_size: int = 1,
+            tp_rank: int = 0,
+            dflash_base: bool = False,
+            dflash_tree_base: bool = False,
+            dflash_draft: bool = False,
+            dflash_draft_dir: "str | None" = None,
+            jetspec_base: bool = False,
+            jetspec_tree_base: bool = False,
+            jetspec_draft: bool = False,
+            jetspec_draft_dir: "str | None" = None,
+            dspark_base: bool = False,
+            dspark_tree_base: bool = False,
+            dspark_draft: bool = False,
+            dspark_draft_dir: "str | None" = None,
+            gemma4_mtp_base: bool = False,
+            gemma4_mtp_draft: bool = False,
+            gemma4_kv_sharing_map: "list[dict] | None" = None,
+            gemma4_target_kv_cache_quant: "str | None" = None,
+            num_decoder_layers: "int | None" = None,
+            extra_configs: "dict | None" = None,
+            low_cpu_mem_usage: bool = False,
+            key_filter: "Callable[[str], bool] | None" = None) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -769,13 +780,18 @@ class AutoModel:
 
             pre_repack_hook = _load_pre_repack_dflash_lm_head
 
+        effective_key_filter = key_filter
+        if (effective_key_filter is None
+                and config.model_type in ("qwen4_exp", "qwen4_exp_text")):
+            effective_key_filter = _qwen4_exp_text_key_filter
         load_weights(model,
                      model_dir,
                      device=device,
                      key_remap=key_remap,
                      key_prefix=key_prefix,
                      pre_repack_hook=pre_repack_hook,
-                     mapping=config.mapping)
+                     mapping=config.mapping,
+                     key_filter=effective_key_filter)
         if low_cpu_mem_usage:
             _materialize_checkpoint_defaults(model, device)
             _materialize_optional_scale_buffers(model, device)
@@ -811,8 +827,11 @@ class AutoModel:
             fuse_gdn_input_projections(model)
 
         # Fuse attention Q/K/V projections into one packed-QKV GEMM where eligible.
-        from .models.default.modeling_default import fuse_qkv_projections
-        fuse_qkv_projections(model)
+        # Qwen4-Exp keeps the Q projection's per-head query/gate packing and the
+        # QSA/indexer projections separate, so leave its graph untouched.
+        if config.model_type not in ("qwen4_exp", "qwen4_exp_text"):
+            from .models.default.modeling_default import fuse_qkv_projections
+            fuse_qkv_projections(model)
 
         return model
 

@@ -25,6 +25,7 @@
 #include "common/stringUtils.h"
 #include "kernels/contextAttentionKernels/utilKernels.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
+#include "runtime/llmRuntimeUtils.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -162,6 +163,17 @@ void PipelineIO::uploadRaggedMetadata(RaggedExecutionBatch const& batch, cudaStr
             && logitsIndices.reshape({logits})
             && contextSequenceCountCarrier.reshape({batch.shape.numContextSequences}),
         "Ragged device metadata reshape failed");
+    if (!pleEmbeds.isEmpty())
+    {
+        check::check(pleEmbeds.reshape({tokens, pleEmbedDim}), "Qwen4 PLE embedding reshape failed");
+    }
+    if (!qsaKVCacheStartIndex.isEmpty())
+    {
+        // QSA mode is selected by this binding's runtime extent: [0] = context
+        // prefill, [B] = single-token decode. Mixed steps are not supported.
+        int32_t const startLen = batch.shape.numContextSequences > 0 ? 0 : sequences;
+        check::check(qsaKVCacheStartIndex.reshape({startLen}), "QSA start-index reshape failed");
+    }
     check::check(hostPositions.reshape({tokens}) && hostQueryStartOffsets.reshape({sequences + 1})
             && hostQueryLengths.reshape({sequences}) && hostPastLengths.reshape({sequences})
             && hostAttentionSequenceLengths.reshape({sequences}) && hostStateIndices.reshape({sequences})
@@ -192,6 +204,13 @@ void PipelineIO::uploadRaggedMetadata(RaggedExecutionBatch const& batch, cudaStr
     upload(attentionSequenceLengths, hostAttentionSequenceLengths);
     upload(stateIndices, hostStateIndices);
     upload(logitsIndices, hostLogitsIndices);
+    if (!qsaKVCacheStartIndex.isEmpty() && batch.shape.numContextSequences == 0)
+    {
+        // Decode only uses the extent as a mode selector, but mirror the past lengths so the values
+        // stay meaningful for debugger inspection.
+        CUDA_CHECK(cudaMemcpyAsync(qsaKVCacheStartIndex.rawPointer(), pastLengths.rawPointer(),
+            static_cast<size_t>(sequences) * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+    }
     mRaggedMetadataUploadFence.record(stream);
 }
 
@@ -461,6 +480,17 @@ static void buildTensorMapImpl(
     map.set(binding_names::kLogits, io.outputLogits);
     bindUnifiedDecoderMetadata(map, io);
     map.set(binding_names::kLogitsIndices, io.logitsIndices);
+    if (!io.pleEmbeds.isEmpty())
+    {
+        map.set(binding_names::kPleEmbeds, io.pleEmbeds);
+        map.set(binding_names::kPleConvState, io.pleConvState);
+        map.set(binding_names::kPresentPleConvState, io.pleConvStateOut);
+    }
+    if (!io.qsaRopeTable.isEmpty())
+    {
+        map.set(binding_names::kQsaRopeTable, io.qsaRopeTable);
+        map.set(binding_names::kKVCacheStartIndex, io.qsaKVCacheStartIndex);
+    }
     if (cfg.isDiffusionBackbone)
     {
         bindDiffusionGemmaBackboneTensorMap(map, io, cfg);
@@ -723,6 +753,16 @@ void buildTensorMapForGemma4MTPDraft(
     }
 }
 
+void PipelineIO::commitQwen4PleState(cudaStream_t stream)
+{
+    if (pleConvState.isEmpty())
+    {
+        return;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(pleConvState.rawPointer(), pleConvStateOut.rawPointer(),
+        pleConvState.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
+}
+
 PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream)
 {
     PipelineIO io;
@@ -732,6 +772,33 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
     allocateRaggedMetadata(
         io, cfg.maxPhysicalTokens, cfg.maxNumSequences, maxLogitsRows, cfg.maxKVCacheCapacity, cfg.hiddenSize);
     allocateRaggedRope(io, cfg);
+
+    if (cfg.qwen4PleEnabled)
+    {
+        check::check(cfg.qwen4PleEmbedDim > 0 && cfg.qwen4PleHiddenSize > 0 && cfg.qwen4PleStateLen > 0,
+            "Qwen4 PLE engine config is missing a positive dim/state length");
+        io.pleEmbedDim = cfg.qwen4PleEmbedDim;
+        io.pleEmbeds = Tensor({cfg.maxPhysicalTokens, cfg.qwen4PleEmbedDim}, DeviceType::kGPU,
+            nvinfer1::DataType::kHALF, "PipelineIO::pleEmbeds");
+        // A zero lookup table disables the PLE contribution cleanly until the
+        // n-gram preprocessor publishes real rows.
+        CUDA_CHECK(cudaMemsetAsync(io.pleEmbeds.rawPointer(), 0, io.pleEmbeds.getMemoryCapacity(), stream));
+        io.pleConvState = Tensor({cfg.recurrentPoolRows, cfg.qwen4PleHiddenSize, cfg.qwen4PleStateLen},
+            DeviceType::kGPU, cfg.convStateDtype, "PipelineIO::pleConvState");
+        io.pleConvStateOut = Tensor({cfg.recurrentPoolRows, cfg.qwen4PleHiddenSize, cfg.qwen4PleStateLen},
+            DeviceType::kGPU, cfg.convStateDtype, "PipelineIO::pleConvStateOut");
+        CUDA_CHECK(cudaMemsetAsync(io.pleConvState.rawPointer(), 0, io.pleConvState.getMemoryCapacity(), stream));
+        CUDA_CHECK(cudaMemsetAsync(io.pleConvStateOut.rawPointer(), 0, io.pleConvStateOut.getMemoryCapacity(), stream));
+    }
+    if (cfg.qsaEnabled)
+    {
+        io.qsaRopeTable = Tensor({1, cfg.maxKVCacheCapacity, cfg.rotaryDim}, DeviceType::kGPU,
+            nvinfer1::DataType::kFLOAT, "PipelineIO::qsaRopeTable");
+        check::check(initializeRopeCosSinCache(io.qsaRopeTable, cfg.ropeConfig, stream),
+            "Failed to initialize the QSA RoPE table");
+        io.qsaKVCacheStartIndex = Tensor(
+            {cfg.maxNumSequences}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::qsaKVCacheStartIndex");
+    }
 
     if (cfg.isDiffusionBackbone)
     {

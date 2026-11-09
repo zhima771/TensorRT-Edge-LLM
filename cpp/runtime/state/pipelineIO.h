@@ -125,6 +125,16 @@ struct PipelineIO
     Tensor raggedRopeCosSinSliding;
     Tensor raggedRopeCosSinFull;
 
+    //! Qwen4-Exp n-gram PLE side path (empty unless the engine enables it).
+    Tensor pleEmbeds;       //!< [physical_tokens, qwen4_ple_embed_dim] FP16
+    Tensor pleConvState;    //!< [recurrentPoolRows, hc*hidden, state_len] FP16
+    Tensor pleConvStateOut; //!< Engine output; committed back into pleConvState
+    int32_t pleEmbedDim{0};
+
+    //! Qwen4-Exp QSA full-attention helpers.
+    Tensor qsaRopeTable;         //!< [1, maxKVCacheCapacity, rotaryDim] FP32
+    Tensor qsaKVCacheStartIndex; //!< [0] for context prefills, [B] for decode
+
     // Spec decode
     Tensor baseHiddenStates;
     Tensor draftHiddenStatesIn;
@@ -167,6 +177,9 @@ struct PipelineIO
     //! DDTree depth per node, [physical_tokens] INT32. Runtime-owned
     //! metadata for tree attention and hybrid state plugin bindings.
     Tensor specTreeDepths;
+
+    //! Copy the engine-produced PLE state back into the bound input pool.
+    void commitQwen4PleState(cudaStream_t stream);
 
     //! Build PipelineIO for the vanilla single-engine LLM runtime
     //! (basic I/O tensors, deepstack embeds, MRope cos/sin cache).

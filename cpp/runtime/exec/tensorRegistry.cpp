@@ -61,6 +61,45 @@ std::vector<TensorSpec> TensorRegistry::expandPerLayer(TensorSpec const& spec) c
     return result;
 }
 
+namespace
+{
+bool engineHasIOTensor(nvinfer1::ICudaEngine const& engine, std::string const& name)
+{
+    int32_t const numIO = engine.getNbIOTensors();
+    for (int32_t i = 0; i < numIO; ++i)
+    {
+        char const* const ioName = engine.getIOTensorName(i);
+        if (ioName != nullptr && name == ioName)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+void TensorRegistry::retainEngineTensors(nvinfer1::ICudaEngine const& engine)
+{
+    auto const before = mSpecs.size();
+    mSpecs.erase(std::remove_if(mSpecs.begin(), mSpecs.end(),
+                     [this, &engine](TensorSpec const& spec) {
+                         for (auto const& expanded : expandPerLayer(spec))
+                         {
+                             if (engineHasIOTensor(engine, expanded.name))
+                             {
+                                 return false;
+                             }
+                         }
+                         return true;
+                     }),
+        mSpecs.end());
+    mDirty = true;
+    if (mSpecs.size() != before)
+    {
+        LOG_DEBUG("TensorRegistry: dropped %zu spec(s) not present in the engine", before - mSpecs.size());
+    }
+}
+
 std::vector<TensorSpec> const& TensorRegistry::allExpandedSpecs() const
 {
     if (mDirty)

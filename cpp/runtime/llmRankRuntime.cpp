@@ -3373,6 +3373,7 @@ bool LLMRankRuntime::runBaseModelPrefill(
     check::check(mBaseExecutor->prepare(kPrefillProfile, prefillDims, mBaseTensorMap, context.stream),
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
+    mPipelineIO->commitQwen4PleState(context.stream);
     context.completionSequences.resize(static_cast<size_t>(activeBatchSize));
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {

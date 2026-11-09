@@ -60,6 +60,7 @@ from .models.qwen3_omni_next.modeling_qwen3_omni_next_moe_text import \
     Qwen3OmniNextMoeLanguageModel
 from .models.qwen3_omni_next.modeling_qwen3_omni_next_text import \
     Qwen3OmniNextLanguageModel
+from .models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpCausalLM
 from .onnx.export import export_onnx
 
 
@@ -94,6 +95,8 @@ register_model("cosmos3_edge", Cosmos3ReasonerCausalLM,
                standard_attention_scale)
 register_model("cosmos3_edge_text", Cosmos3ReasonerCausalLM,
                standard_attention_scale)
+register_model("qwen4_exp", Qwen4ExpCausalLM, standard_attention_scale)
+register_model("qwen4_exp_text", Qwen4ExpCausalLM, standard_attention_scale)
 register_model("qwen3_5_text", Qwen3_5CausalLM, standard_attention_scale)
 register_model("qwen3_5_moe_text", Qwen3_5MoeCausalLM,
                standard_attention_scale)

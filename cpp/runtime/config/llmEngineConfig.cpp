@@ -871,6 +871,12 @@ LLMEngineConfig parseEngineConfig(
     cfg.pleEnabled = configJson.value("ple_enabled", false);
     cfg.numPleInputs = configJson.value("num_ple_inputs", 0);
     cfg.pleHiddenSize = configJson.value("ple_hidden_size", 0);
+    cfg.qwen4PleEnabled = configJson.value("qwen4_ple_enabled", false);
+    cfg.qwen4PleEmbedDim = configJson.value("qwen4_ple_embed_dim", 0);
+    cfg.qwen4PleHiddenSize = configJson.value("qwen4_ple_hidden_size", 0);
+    cfg.qwen4PleStateLen = configJson.value("qwen4_ple_state_len", 0);
+    cfg.qwen4PleEosTokenId = configJson.value("qwen4_ple_eos_token_id", 0);
+    cfg.qsaEnabled = configJson.value("qsa_enabled", false);
     cfg.audioTokenId = configJson.value("audio_token_id", -1);
     cfg.imageTokenId = configJson.value("image_token_id", -1);
     bool const usesMultimodalPle = cfg.pleEnabled && (cfg.audioTokenId >= 0 || cfg.imageTokenId >= 0);

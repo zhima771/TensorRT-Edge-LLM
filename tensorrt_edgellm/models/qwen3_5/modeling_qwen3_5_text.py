@@ -214,6 +214,8 @@ class GdnMixer(nn.Module):
         self.tp_mode = (TPMode.COL
                         if config.tp_size > 1 else TPMode.REPLICATED)
 
+        self.gate_activation = str(getattr(config, "gdn_output_gate",
+                                           "silu")).lower()
         self.num_k_heads = gc.num_key_heads
         self.num_v_heads = gc.num_value_heads
         self.k_dim = gc.key_head_dim
@@ -334,7 +336,8 @@ class GdnMixer(nn.Module):
         core_attn_out = core_attn_out.reshape(-1, self.v_dim)
         z = z.reshape(-1, self.v_dim)
         core_attn_out = self.norm(core_attn_out)
-        core_attn_out = core_attn_out * F.silu(z)
+        core_attn_out = core_attn_out * (torch.sigmoid(
+            z) if self.gate_activation == "sigmoid" else F.silu(z))
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         # 6. Output projection
@@ -449,7 +452,9 @@ class GdnMixer(nn.Module):
                 tree_depths=tree_depths,
                 use_ddtree_state=tree_parent_ids is not None)
         core_attn_out = self.norm(core_attn_out.reshape(-1, self.v_dim))
-        core_attn_out = core_attn_out * F.silu(z.reshape(-1, self.v_dim))
+        z = z.reshape(-1, self.v_dim)
+        core_attn_out = core_attn_out * (torch.sigmoid(
+            z) if self.gate_activation == "sigmoid" else F.silu(z))
         core_attn_out = core_attn_out.reshape(hidden_states.shape[0],
                                               self.value_dim)
         return (self.out_proj(core_attn_out), conv_state_out,

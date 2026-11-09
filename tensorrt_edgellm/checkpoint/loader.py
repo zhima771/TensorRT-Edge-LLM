@@ -32,6 +32,7 @@ Usage
     load_weights(model, model_dir)                 # fills all buffers in-place
 """
 
+import glob
 import json
 import logging
 import os
@@ -109,6 +110,7 @@ def load_weights(
     key_prefix: Optional[str] = None,
     pre_repack_hook: Optional[Callable[[nn.Module], None]] = None,
     mapping: Optional[Mapping] = None,
+    key_filter: "Optional[Callable[[str], bool]]" = None,
 ) -> None:
     """Load all safetensors weights from *model_dir* into *model* in-place.
 
@@ -133,6 +135,10 @@ def load_weights(
                     :func:`_shard_for_module` to slice each NVFP4
                     weight/scale to its per-rank shard before assignment.
                     Must match ``ModelConfig.mapping`` used to build *model*.
+        key_filter: Optional predicate on the final model key.  Keys rejected
+                    here are skipped before their tensor is read, which keeps
+                    large checkpoint sidecars (for example the Qwen4-Exp
+                    27 GiB n-gram table) out of host memory.
     """
     mapping = mapping or Mapping()
     shard_map = _build_shard_map(model_dir)
@@ -196,7 +202,6 @@ def load_weights(
         else:
             with safe_open(shard_path, framework="pt", device=device) as f:
                 for key in keys:
-                    tensor = f.get_tensor(key)
                     mapped_key = _apply_prefix(key)
                     if mapped_key is None:
                         skipped += 1
@@ -206,6 +211,10 @@ def load_weights(
                         if mapped_key is None:
                             skipped += 1
                             continue
+                    if key_filter is not None and not key_filter(mapped_key):
+                        skipped += 1
+                        continue
+                    tensor = f.get_tensor(key)
                     if _set_tensor(model, mapped_key, tensor, mapping=mapping):
                         loaded += 1
                     elif _try_split_fused_tensor(model,
@@ -309,7 +318,47 @@ def _resolve_shard(model_dir: str, shard: str) -> str:
     return str(candidate)
 
 
+def _build_hybrid_overrides(model_dir: str) -> Dict[str, str]:
+    """Return checkpoint-key -> shard overrides declared by ``HYBRID.json``.
+
+    Qwen3.8-Flash-Next ships a base trunk plus sibling ``hybrid-main-*.safetensors``
+    files that replace selected projection blocks and the MTP experts.  The
+    index does not mention those files, so fold their matching keys into the
+    shard map; later entries win in the caller's dict update.
+    """
+    hybrid_path = os.path.join(model_dir, "HYBRID.json")
+    if not os.path.isfile(hybrid_path):
+        return {}
+    with open(hybrid_path) as f:
+        hybrid = json.load(f)
+    prefixes = {str(p) for p in hybrid.get("replaced_modules", []) if p}
+    if not prefixes:
+        return {}
+
+    def _matches(key: str) -> bool:
+        parts = key.split(".")
+        return any(".".join(parts[:i]) in prefixes
+                   for i in range(len(parts), 0, -1))
+
+    overrides: Dict[str, str] = {}
+    for shard in sorted(
+            glob.glob(os.path.join(model_dir, "hybrid-main-*.safetensors"))):
+        with safe_open(shard, framework="pt") as f:
+            for key in f.keys():
+                if _matches(key):
+                    overrides[key] = shard
+    return overrides
+
+
 def _build_shard_map(model_dir: str) -> Dict[str, str]:
+    mapping = _build_shard_map_base(model_dir)
+    overrides = _build_hybrid_overrides(model_dir)
+    if overrides:
+        mapping.update(overrides)
+    return mapping
+
+
+def _build_shard_map_base(model_dir: str) -> Dict[str, str]:
     """Return a mapping of weight-key -> absolute shard file path.
 
     Handles:

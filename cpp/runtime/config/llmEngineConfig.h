@@ -157,6 +157,14 @@ struct LLMEngineConfig
     int32_t numPleInputs{0};         //!< Number of PLE tensors bound into the engine (0 = disabled)
     int32_t pleHiddenSize{0};        //!< Hidden dimension of each PLE tensor (0 = disabled)
     int32_t padTokenId{0};           //!< PLE row gathered for media placeholder tokens
+    //!< Qwen4-Exp n-gram PLE side path.
+    bool qwen4PleEnabled{false};
+    int32_t qwen4PleEmbedDim{0};
+    int32_t qwen4PleHiddenSize{0};
+    int32_t qwen4PleStateLen{0};
+    int32_t qwen4PleEosTokenId{0};
+    //!< Qwen4-Exp QSA full-attention layers.
+    bool qsaEnabled{false};
     int32_t maxSupportedLoraRank{0}; //!< Maximum LoRA rank (0 = no LoRA)
 
     //! Additional EOS token IDs parsed from config.json `eos_token_id` array.

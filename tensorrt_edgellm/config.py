@@ -566,6 +566,62 @@ class GdnConfig:
 
 
 @dataclass
+class QsaConfig:
+    """Qwen Sparse Attention (QSA) indexer hyper-parameters.
+
+    Qwen4-Exp full-attention layers carry a weight-free block-compressed
+    indexer.  The attention geometry (Q/KV heads and head size) stays on
+    :class:`ModelConfig`; this dataclass only holds the indexer contract that
+    the ``QsaAttentionPlugin`` specializes on.
+    """
+
+    indexer_n_heads: int
+    indexer_head_dim: int
+    indexer_kv_heads: int
+    indexer_budget: int
+    indexer_compress_ratio: int
+
+
+@dataclass
+class PleConfig:
+    """Qwen4-Exp n-gram per-layer embedding (PLE) side path.
+
+    ``layer_ids`` are one-based decoder-layer indices (the checkpoint stores
+    PLE tensors under ``layers.{id-1}.ple``).  The n-gram table is a runtime
+    sidecar; the model only owns the projection/gate/short-conv parameters.
+    """
+
+    layer_ids: List[int]
+    ngram_size: int
+    heads_per_ngram: int
+    embed_dim: int
+    conv_kernel_size: int
+    ngram_vocab_size_base: int
+    vocab_size_divisible_by: int
+    split_parts: int
+    embedding_dtype: str
+
+    @property
+    def num_ngram_heads(self) -> int:
+        return (self.ngram_size - 1) * self.heads_per_ngram
+
+    @property
+    def head_dim(self) -> int:
+        if self.num_ngram_heads <= 0:
+            raise ValueError("PleConfig requires ngram_size >= 2 and "
+                             "heads_per_ngram > 0")
+        if self.embed_dim % self.num_ngram_heads != 0:
+            raise ValueError(
+                "ple_embed_dim must be divisible by the n-gram head count: "
+                f"{self.embed_dim} % {self.num_ngram_heads} != 0")
+        return self.embed_dim // self.num_ngram_heads
+
+    @property
+    def conv_state_len(self) -> int:
+        return (self.conv_kernel_size - 1) * self.ngram_size
+
+
+@dataclass
 class DiffusionConfig:
     """Block-diffusion generation parameters parsed at export time."""
 
@@ -888,6 +944,22 @@ class ModelConfig:
     # Gemma4 26B-A4B MoE: when True, each decoder layer has a routed MoE
     # block in addition to the dense MLP (parallel experts + router).
     enable_moe_block: bool = False
+    # ------------------------------------------ Qwen4-Exp (Qwen3.8-Flash-Next)
+    # First EOS token id (scalar form of HF's scalar-or-list field). Used by
+    # side paths such as the Qwen4-Exp n-gram PLE boundary.
+    eos_token_id: Optional[int] = None
+    # Qwen Sparse Attention (QSA) block-compressed indexer.
+    qsa_cfg: Optional[QsaConfig] = None
+    # Hyper-connections: number of parallel residual streams and the low-rank
+    # width of the per-layer mix projections. hc_count == 1 keeps the standard
+    # residual.
+    hc_count: int = 1
+    hc_lowrank: int = 0
+    hc_per_branch_norm: bool = True
+    # N-gram per-layer-embedding side path.
+    ple_cfg: Optional[PleConfig] = None
+    # GDN output-gate activation. Qwen3.5 uses SiLU; Qwen4-Exp uses sigmoid.
+    gdn_output_gate: str = "silu"
     # ------------------------------------------ tensor parallel
     # ``mapping`` is the single source of truth for parallel placement.
     # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
@@ -1040,6 +1112,10 @@ class ModelConfig:
         import copy
         if world == 1:
             return self
+        if self.qsa_cfg is not None or self.ple_cfg is not None:
+            raise NotImplementedError(
+                "Qwen4-Exp text export currently supports TP=1; the QSA/PLE "
+                "side paths are not shard-aware yet.")
         parallel_dimensions = [
             ("num_attention_heads", self.num_attention_heads),
             ("num_key_value_heads", self.num_key_value_heads),
@@ -1139,6 +1215,9 @@ class ModelConfig:
                                      layer_types,
                                      model_dir=model_dir)
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
+        is_qwen4_exp = _is_qwen4_exp_model_type(model_type)
+        qsa_cfg = _parse_qsa_cfg(llm_dict) if is_qwen4_exp else None
+        ple_cfg = _parse_ple_cfg(llm_dict) if is_qwen4_exp else None
         has_qk_norm = _detect_has_qk_norm(model_dir, model_type)
         has_value_norm = _get_has_value_norm(llm_dict, model_type)
         default_attention_scale_value = float(
@@ -1196,6 +1275,14 @@ class ModelConfig:
             mtp_num_hidden_layers = len(mtp_layer_types)
         mtp_use_dedicated_embeddings = bool(
             llm_dict.get("mtp_use_dedicated_embeddings", False))
+        if is_qwen4_exp:
+            # Qwen4-Exp text-only bring-up does not consume the checkpoint's
+            # MTP head. Its config names a 1-layer MTP stack that the generic
+            # MTP parser does not (yet) model, so keep the base export dense.
+            mtp_num_hidden_layers = None
+            mtp_hybrid_override_pattern = None
+            mtp_layer_types = []
+            mtp_use_dedicated_embeddings = False
         _validate_mtp_constraints(
             model_type=model_type,
             mtp_num_hidden_layers=mtp_num_hidden_layers,
@@ -1289,9 +1376,14 @@ class ModelConfig:
                     root.get("self_conditioning_size", intermediate_size))
                 or intermediate_size)
 
+        eos_value = llm_dict.get("eos_token_id", root.get("eos_token_id"))
+        if isinstance(eos_value, (list, tuple)):
+            eos_value = eos_value[0] if eos_value else None
+        eos_token_id = int(eos_value) if eos_value is not None else None
         return cls(
             model_type=model_type,
             hidden_size=hidden_size,
+            eos_token_id=eos_token_id,
             num_hidden_layers=llm_dict["num_hidden_layers"],
             num_attention_heads=num_attn_heads,
             num_key_value_heads=num_kv_heads,
@@ -1348,7 +1440,14 @@ class ModelConfig:
             quant=quant,
             mamba_cfg=mamba_cfg,
             gdn_cfg=gdn_cfg,
-            attn_output_gate=bool(llm_dict.get("attn_output_gate", False)),
+            qsa_cfg=qsa_cfg,
+            hc_count=int(llm_dict.get("hc_count", 1) or 1),
+            hc_lowrank=int(llm_dict.get("hc_lowrank", 0) or 0),
+            hc_per_branch_norm=bool(llm_dict.get("hc_per_branch_norm", True)),
+            ple_cfg=ple_cfg,
+            gdn_output_gate=str(llm_dict.get("output_gate_type", "silu")),
+            attn_output_gate=(bool(llm_dict.get("attn_output_gate", False))
+                              or is_qwen4_exp),
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
             mtp_hybrid_override_pattern=mtp_hybrid_override_pattern,
@@ -1991,6 +2090,8 @@ def _canonical_layer_type(block_type: str, is_nemotron_h: bool) -> str:
         return LAYER_MAMBA if is_nemotron_h else LAYER_GDN
     if "mamba" in bt:
         return LAYER_MAMBA
+    if bt == "gdn":
+        return LAYER_GDN
     if bt == "moe":
         return LAYER_MOE
     if "mlp" in bt:
@@ -2138,6 +2239,42 @@ def _parse_gdn_cfg(config: dict,
         key_head_dim=config.get("linear_key_head_dim", 0),
         value_head_dim=config.get("linear_value_head_dim", 0),
         conv_kernel=config.get("linear_conv_kernel_dim", 4),
+    )
+
+
+def _is_qwen4_exp_model_type(model_type: str) -> bool:
+    return str(model_type).lower().startswith("qwen4_exp")
+
+
+def _parse_qsa_cfg(config: dict) -> Optional[QsaConfig]:
+    """Parse the Qwen4-Exp sparse-attention indexer fields."""
+    if config.get("indexer_n_heads") is None:
+        return None
+    return QsaConfig(
+        indexer_n_heads=int(config["indexer_n_heads"]),
+        indexer_head_dim=int(config.get("indexer_head_dim", 128)),
+        indexer_kv_heads=int(config.get("indexer_kv_heads", 1)),
+        indexer_budget=int(config.get("indexer_budget", 2048)),
+        indexer_compress_ratio=int(config.get("indexer_compress_ratio", 4)),
+    )
+
+
+def _parse_ple_cfg(config: dict) -> Optional[PleConfig]:
+    """Parse the Qwen4-Exp n-gram PLE fields."""
+    raw_ids = config.get("ple_layer_ids") or []
+    if not raw_ids:
+        return None
+    return PleConfig(
+        layer_ids=[int(layer_id) for layer_id in raw_ids],
+        ngram_size=int(config.get("ngram_size", 3)),
+        heads_per_ngram=int(config.get("heads_per_ngram", 8)),
+        embed_dim=int(config.get("ple_embed_dim", 0)),
+        conv_kernel_size=int(config.get("ple_conv_kernel_size", 4)),
+        ngram_vocab_size_base=int(config.get("ngram_vocab_size_base", 0)),
+        vocab_size_divisible_by=int(
+            config.get("make_ngram_vocab_size_divisible_by", 128)),
+        split_parts=int(config.get("split_ngram_parts", 128)),
+        embedding_dtype=str(config.get("ple_embedding_dtype", "nvfp4")),
     )
 
 
@@ -2480,6 +2617,12 @@ def _parse_quant(model_dir: str,
         with open(hf_path) as f:
             hq = json.load(f)
         q = hq.get("quantization", {})
+        if not q and "quant_algo" in hq:
+            # Some ModelOpt releases write the quantization block flat at the
+            # sidecar root instead of nesting it under "quantization".
+            q = hq
+        if isinstance(q, dict):
+            q.setdefault("exclude_modules", list(q.get("ignore", [])))
         algo = (q.get("quant_algo") or "").upper()
         if "AWQ" in algo and "W4A16" in algo:
             # Drop exclusions that the checkpoint contradicts (false positives),
@@ -2514,24 +2657,25 @@ def _parse_quant(model_dir: str,
                 layer_group_sizes=layer_group_sizes,
                 is_mixed_precision=True,
             )
-        qt = _select_nvfp4_quant_type(_algo_to_quant_type(algo), algo,
-                                      config.get("model_type") or "")
-        gs = int(q.get("group_size", 1))
-        if qt == QUANT_MXFP8 and gs == 1:
-            gs = 32  # MXFP8 default block_size
-        excluded = _effective_excluded_modules(
-            model_dir,
-            _scope_exclusions(list(q.get("exclude_modules", [])),
-                              submodel_prefix))
-        excluded.extend(m for m in _detect_modelopt_unquantized_linears(
-            model_dir, submodel_prefix) if m not in excluded)
-        return QuantConfig(
-            quant_type=qt,
-            group_size=gs,
-            kv_cache_quant=_detect_llm_kv_cache_fp8(model_dir),
-            visual_mha_quant=_detect_visual_mha_fp8(model_dir),
-            excluded=excluded,
-        )
+        if algo:
+            qt = _select_nvfp4_quant_type(_algo_to_quant_type(algo), algo,
+                                          config.get("model_type") or "")
+            gs = int(q.get("group_size", 1))
+            if qt == QUANT_MXFP8 and gs == 1:
+                gs = 32  # MXFP8 default block_size
+            excluded = _effective_excluded_modules(
+                model_dir,
+                _scope_exclusions(list(q.get("exclude_modules", [])),
+                                  submodel_prefix))
+            excluded.extend(m for m in _detect_modelopt_unquantized_linears(
+                model_dir, submodel_prefix) if m not in excluded)
+            return QuantConfig(
+                quant_type=qt,
+                group_size=gs,
+                kv_cache_quant=_detect_llm_kv_cache_fp8(model_dir),
+                visual_mha_quant=_detect_visual_mha_fp8(model_dir),
+                excluded=excluded,
+            )
 
     # ---- Embedded quantization_config in config.json ------------------------
     qc = config.get("quantization_config")

@@ -169,6 +169,10 @@ TrtEngineExecutor::TrtEngineExecutor(std::filesystem::path const& enginePath, Te
 
     mEngine = deserializeCudaEngineFromFile(*mRuntime, enginePath);
 
+    // Variant graphs (Qwen4-Exp QSA) replace parts of the unified decoder ABI, so keep only the
+    // specs this engine actually exposes. Engine tensors missing a binding still fail in prepare().
+    mRegistry.retainEngineTensors(*mEngine);
+
 #if IS_TRT_RTX
     mRuntimeCache = std::move(runtimeCache);
     if (mRuntimeCache != nullptr)
@@ -294,7 +298,7 @@ bool TrtEngineExecutor::prepare(
         return false;
     }
     bool const hasIndependentDeltaPortal = mRegistry.contains(binding_names::kDFlashTargetHiddenConcat);
-    if (mRegistry.contains(binding_names::kPositions)
+    if (mRegistry.contains(binding_names::kQueryStartOffsets)
         && !validateRaggedInferenceDims(dims, profileIndex, hasIndependentDeltaPortal))
     {
         LOG_ERROR("EngineExecutor::prepare: inconsistent ragged step dimensions for profile %d", profileIndex);

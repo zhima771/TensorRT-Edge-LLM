@@ -124,6 +124,19 @@ public:
     std::vector<TensorSpec> const& allExpandedSpecs() const;
 
     /*!
+     * @brief Drop specs that @p engine does not expose as an I/O tensor.
+     *
+     * The registry describes the full unified decoder ABI, but variants such as
+     * Qwen4-Exp QSA carry ``qsa_rope_table`` instead of the shared RoPE cache and
+     * derive positions/context lengths inside the graph. Pruning keeps
+     * ``bindAll`` aligned with the deserialized engine while the executor's
+     * engine-side sweep still rejects unbound engine tensors.
+     *
+     * @param engine Deserialized engine the registry will serve
+     */
+    void retainEngineTensors(nvinfer1::ICudaEngine const& engine);
+
+    /*!
      * @brief Resolve a shape template into concrete TRT Dims.
      *
      * Fixed dimensions are used as-is. Symbolic dimensions are looked up

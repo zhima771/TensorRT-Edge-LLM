@@ -487,6 +487,11 @@ def build_runtime_llm_config_dict(
         "rms_norm_eps":
         float(config.rms_norm_eps),
     }
+    if config.model_type in ("qwen4_exp", "qwen4_exp_text"):
+        # Text-only Flash-Next uses mRoPE positions that are identical on all
+        # three axes, which is exactly 1-D RoPE. The QSA plugin consumes a
+        # single 1-D table, so publish the standard type for the runtime.
+        out["rope_scaling"] = {"type": "default"}
     if config.attention_scaling:
         out["attention_scaling"] = float(config.attention_scaling)
     if config.final_logit_softcapping is not None:
@@ -576,6 +581,39 @@ def build_runtime_llm_config_dict(
     out["num_ple_inputs"] = config.num_hidden_layers if ple_enabled else 0
     out["ple_hidden_size"] = (config.hidden_size_per_layer_input
                               if ple_enabled else 0)
+
+    qwen4_ple = config.ple_cfg
+    qwen4_ple_enabled = qwen4_ple is not None
+    out["qwen4_ple_enabled"] = qwen4_ple_enabled
+    if qwen4_ple_enabled:
+        eos = config.eos_token_id
+        out.update({
+            "qwen4_ple_hidden_size": config.hc_count * config.hidden_size,
+            "qwen4_ple_embed_dim": qwen4_ple.embed_dim,
+            "qwen4_ple_state_len": qwen4_ple.conv_state_len,
+            "qwen4_ple_ngram_size": qwen4_ple.ngram_size,
+            "qwen4_ple_heads_per_ngram": qwen4_ple.heads_per_ngram,
+            "qwen4_ple_num_ngram_heads": qwen4_ple.num_ngram_heads,
+            "qwen4_ple_head_dim": qwen4_ple.head_dim,
+            "qwen4_ple_layer_ids": list(qwen4_ple.layer_ids),
+            "qwen4_ple_split_parts": qwen4_ple.split_parts,
+            "qwen4_ple_ngram_vocab_size_base": qwen4_ple.ngram_vocab_size_base,
+            "qwen4_ple_vocab_size_divisible_by":
+            qwen4_ple.vocab_size_divisible_by,
+            "qwen4_ple_embedding_dtype": qwen4_ple.embedding_dtype,
+            "qwen4_ple_eos_token_id": int(eos) if eos is not None else 0,
+            "qwen4_ple_conv_state_dtype": "fp16",
+        })
+    qsa = config.qsa_cfg
+    out["qsa_enabled"] = qsa is not None
+    if qsa is not None:
+        out.update({
+            "qsa_indexer_n_heads": qsa.indexer_n_heads,
+            "qsa_indexer_head_dim": qsa.indexer_head_dim,
+            "qsa_indexer_kv_heads": qsa.indexer_kv_heads,
+            "qsa_indexer_budget": qsa.indexer_budget,
+            "qsa_indexer_compress_ratio": qsa.indexer_compress_ratio,
+        })
 
     # longrope requires original_max_position_embeddings for scaling factor computation.
     if (isinstance(rope_scaling, dict)
@@ -676,6 +714,9 @@ def build_runtime_llm_config_dict(
                         "num_kv_heads": config.num_key_value_heads,
                         "head_dim": config.head_dim,
                     }
+                    if config.qsa_cfg is not None:
+                        layer_config["head_dim"] = (
+                            config.head_dim + config.qsa_cfg.indexer_head_dim)
                 kv_layer_configs.append(layer_config)
             elif lt in (LAYER_MAMBA, LAYER_GDN):
                 normalized_layer_types.append("mamba")
@@ -1097,7 +1138,8 @@ def write_runtime_artifacts(model: "CausalLM",
     # reads vision_config from the LLM config.json.  Preserve it from the
     # original HF config so the runtime can find deepstack_visual_indexes,
     # num_position_embeddings, etc.
-    if root_cfg.get("vision_config"):
+    if (root_cfg.get("vision_config") and model.config.model_type
+            not in ("qwen4_exp", "qwen4_exp_text")):
         cfg_json["vision_config"] = root_cfg["vision_config"]
     # Propagate eos_token_id so the C++ runtime can stop on any EOS
     # token (e.g. Gemma4 uses [1, 106]). Union config.json with

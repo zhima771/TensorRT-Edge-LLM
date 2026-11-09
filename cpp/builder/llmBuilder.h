@@ -543,6 +543,10 @@ private:
     bool setupConvStateProfiles(
         nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
 
+    //! Configure the Qwen4-Exp PLE/QSA auxiliary binding profiles.
+    bool setupQwen4PleProfiles(nvinfer1::IOptimizationProfile* contextProfile,
+        nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const& network);
+
     //! Set up optimization profiles for MTP intermediate recurrent state output tensors.
     //! These are per-step checkpoints of GDN recurrent states during tree verification.
     //! Only needed for hybrid MTP/DFlash/JetSpec/DSpark base verification engines.
@@ -629,6 +633,11 @@ private:
     int32_t mRecurrentStateSize{0};     //!< Recurrent state size
     int32_t mConvDim{0};                //!< Conv state dimension
     int32_t mConvKernel{0};             //!< Conv kernel size (d_conv)
+    bool mQwen4PleEnabled{false};       //!< Qwen4-Exp n-gram PLE side path
+    int32_t mQwen4PleEmbedDim{0};       //!< PLE lookup embedding width
+    int32_t mQwen4PleHiddenSize{0};     //!< PLE short-conv channel count (hc*hidden)
+    int32_t mQwen4PleStateLen{0};       //!< PLE short-conv history length
+    bool mQsaEnabled{false};            //!< Qwen4-Exp sparse attention layers
     Json mModelConfig;                  //!< Parsed model configuration
     Json mSharedModelConfig;            //!< Shared runtime config before rank-local overrides
     bool mIsDiffusionBackbone{false};   //!< Whether this builder builds the DiffusionGemma DLLM engine

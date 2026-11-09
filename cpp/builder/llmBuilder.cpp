@@ -386,7 +386,10 @@ bool LLMBuilder::build()
     LOG_DEBUG(
         "ONNX parsing complete. mNbKVCacheInputs=%d, mNumLinearAttnLayers=%d", mNbKVCacheInputs, mNumLinearAttnLayers);
 
-    ELLM_CHECK(hasInputBinding(*network, binding_names::kPositions),
+    // Qwen4-Exp QSA layers resolve absolute positions from their resident RoPE table, so their graph
+    // carries qsa_rope_table in place of the token-major positions input.
+    ELLM_CHECK(
+        hasInputBinding(*network, binding_names::kPositions) || hasInputBinding(*network, binding_names::kQsaRopeTable),
         "LLMBuilder: every common decoder ONNX must expose the unified token-major ABI. Re-export the model.");
     ELLM_CHECK(getInputRank(*network, binding_names::kInputsEmbeds) == 2,
         "LLMBuilder: inputs_embeds must be rank-2 [physical_tokens, hidden_size]. Re-export the model.");
@@ -605,6 +608,11 @@ bool LLMBuilder::parseConfig()
     mRecurrentStateSize = mModelConfig.value("recurrent_state_size", 0);
     mConvDim = mModelConfig.value("conv_dim", 0);
     mConvKernel = mModelConfig.value("conv_kernel", 0);
+    mQwen4PleEnabled = mModelConfig.value("qwen4_ple_enabled", false);
+    mQwen4PleEmbedDim = mModelConfig.value("qwen4_ple_embed_dim", 0);
+    mQwen4PleHiddenSize = mModelConfig.value("qwen4_ple_hidden_size", 0);
+    mQwen4PleStateLen = mModelConfig.value("qwen4_ple_state_len", 0);
+    mQsaEnabled = mModelConfig.value("qsa_enabled", false);
 
     if (mModelConfig.contains("kv_layer_configs") && mModelConfig["kv_layer_configs"].is_array())
     {
@@ -961,6 +969,7 @@ bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProf
     LOG_DEBUG("Recurrent state profiles done. Setting up Conv state profiles...");
     // Conv state profiles for recurrent causal conv1d layers
     result &= setupConvStateProfiles(&contextProfile, &generationProfile);
+    result &= setupQwen4PleProfiles(&contextProfile, &generationProfile, *network);
     LOG_DEBUG("Conv state profiles done.");
 
     // skip_softmax_scale: [S] INT8 shape-only runtime skip-softmax override carrier.
@@ -1141,7 +1150,14 @@ bool LLMBuilder::setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextPro
     };
 
     setTokenProfile(binding_names::kInputsEmbeds, mHiddenSize);
-    setTokenProfile(binding_names::kPositions);
+    if (mQwen4PleEnabled && mQwen4PleEmbedDim > 0)
+    {
+        setTokenProfile(binding_names::kPleEmbeds, mQwen4PleEmbedDim);
+    }
+    if (hasInputBinding(network, binding_names::kPositions))
+    {
+        setTokenProfile(binding_names::kPositions);
+    }
     if (hasInputBinding(network, binding_names::kVisionBlockIds))
     {
         setTokenProfile(binding_names::kVisionBlockIds);
@@ -1871,6 +1887,36 @@ bool LLMBuilder::setupConvStateProfiles(
     }
 
     LOG_DEBUG("Set up conv state optimization profiles for %d recurrent layers", mNumLinearAttnLayers);
+    return result;
+}
+
+bool LLMBuilder::setupQwen4PleProfiles(nvinfer1::IOptimizationProfile* const contextProfile,
+    nvinfer1::IOptimizationProfile* const generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+    if (mQwen4PleEnabled && mQwen4PleHiddenSize > 0 && mQwen4PleStateLen > 0)
+    {
+        int64_t const poolRows = mBuilderConfig.maxBatchSize;
+        nvinfer1::Dims const stateShape = createDims({poolRows, mQwen4PleHiddenSize, mQwen4PleStateLen});
+        result
+            &= setOptimizationProfile(contextProfile, binding_names::kPleConvState, stateShape, stateShape, stateShape);
+        result &= setOptimizationProfile(
+            generationProfile, binding_names::kPleConvState, stateShape, stateShape, stateShape);
+        LOG_DEBUG("Set up Qwen4-Exp PLE conv-state profiles: [%lld, %d, %d]", static_cast<long long>(poolRows),
+            mQwen4PleHiddenSize, mQwen4PleStateLen);
+    }
+    if (mQsaEnabled && hasInputBinding(network, binding_names::kQsaRopeTable))
+    {
+        // The QSA plugin indexes a full [1, max_pos, rotary_dim] table; the
+        // runtime binds the resident RoPE pool. The table is static per engine.
+        nvinfer1::Dims const tableShape = createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim});
+        result
+            &= setOptimizationProfile(contextProfile, binding_names::kQsaRopeTable, tableShape, tableShape, tableShape);
+        result &= setOptimizationProfile(
+            generationProfile, binding_names::kQsaRopeTable, tableShape, tableShape, tableShape);
+        LOG_DEBUG("Set up QSA RoPE table profile: [1, %lld, %d]",
+            static_cast<long long>(mBuilderConfig.maxKVCacheCapacity), mRotaryDim);
+    }
     return result;
 }
 

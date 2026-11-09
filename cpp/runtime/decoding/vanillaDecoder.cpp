@@ -126,6 +126,7 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
     }
     if (decodingStatus)
     {
+        mRuntime.base.pipelineIO.commitQwen4PleState(context.stream);
         context.completionSequences.resize(static_cast<size_t>(activeBatchSize));
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {

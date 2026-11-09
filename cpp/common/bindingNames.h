@@ -195,6 +195,10 @@ inline constexpr char const* kPleEmbeddingFileName = "ple_embedding.safetensors"
  * Shape: [batch_size, max_seq_len, rotary_dim] (FLOAT32)
  */
 inline constexpr char const* kRopeCosSin = "rope_rotary_cos_sin";
+inline constexpr char const* kPleEmbeds = "ple_embeds";
+inline constexpr char const* kQsaRopeTable = "qsa_rope_table";
+inline constexpr char const* kPleConvState = "ple_conv_state";
+inline constexpr char const* kPresentPleConvState = "present_ple_conv_state";
 
 /*!
  * @brief Rotary positional encoding cos/sin cache tensor for sliding attention layers

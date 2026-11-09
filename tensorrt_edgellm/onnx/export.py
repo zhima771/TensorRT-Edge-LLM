@@ -120,6 +120,9 @@ def export_onnx(
     reject_quantized_lm_head_externalization(model, model_dir,
                                              requested_external_weights)
 
+    prepare_for_export = getattr(model, "prepare_for_export", None)
+    if callable(prepare_for_export):
+        prepare_for_export()
     external_weight_files = _export_model(
         model,
         output_path,
