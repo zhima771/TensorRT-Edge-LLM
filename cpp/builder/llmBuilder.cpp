@@ -969,7 +969,7 @@ bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProf
     LOG_DEBUG("Recurrent state profiles done. Setting up Conv state profiles...");
     // Conv state profiles for recurrent causal conv1d layers
     result &= setupConvStateProfiles(&contextProfile, &generationProfile);
-    result &= setupQwen4PleProfiles(&contextProfile, &generationProfile, *network);
+    result &= setupQwen4PleProfiles(&contextProfile, &generationProfile, network);
     LOG_DEBUG("Conv state profiles done.");
 
     // skip_softmax_scale: [S] INT8 shape-only runtime skip-softmax override carrier.
@@ -2541,7 +2541,18 @@ bool LLMBuilder::copyExternalWeightFiles()
         std::filesystem::path const srcPath = mOnnxDir / filename;
         std::filesystem::path const dstPath = mEngineDir / dstFilename;
 
-        if (file_io::copyFile(srcPath.string(), dstPath.string()))
+        // External weight files can be tens of gigabytes; a hard link keeps the engine bundle
+        // self-contained without a second on-disk copy when both directories share a filesystem.
+        std::error_code removeError;
+        std::filesystem::remove(dstPath, removeError);
+        std::error_code linkError;
+        std::filesystem::create_hard_link(srcPath, dstPath, linkError);
+        bool const linked = !linkError;
+        if (linked)
+        {
+            LOG_INFO("Linked external weight file: %s -> %s", filename.c_str(), dstFilename.c_str());
+        }
+        else if (file_io::copyFile(srcPath.string(), dstPath.string()))
         {
             LOG_INFO("Copied external weight file: %s -> %s", filename.c_str(), dstFilename.c_str());
         }

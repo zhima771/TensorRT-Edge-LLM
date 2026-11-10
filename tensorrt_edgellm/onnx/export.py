@@ -226,15 +226,7 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
                     fixed_value_infos)
     if changed == 0 and fixed_value_infos == 0:
         return
-    data_file = os.path.basename(onnx_path) + ".data"
-    onnx.save_model(
-        model,
-        onnx_path,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=data_file,
-        size_threshold=0,
-    )
+    _save_graph_protobuf(model, onnx_path)
 
 
 def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
@@ -409,15 +401,7 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
         " and restored the dynamic SWA mode shape"
         if mode_shape_changed else "",
     )
-    data_file = os.path.basename(onnx_path) + ".data"
-    onnx.save_model(
-        model,
-        onnx_path,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=data_file,
-        size_threshold=0,
-    )
+    _save_graph_protobuf(model, onnx_path)
 
 
 def _fix_zero_volume_initializers(onnx_path: str) -> None:
@@ -451,6 +435,35 @@ def _fix_zero_volume_initializers(onnx_path: str) -> None:
     onnx.save(model, onnx_path)
 
 
+def _release_freed_heap() -> None:
+    """Return freed glibc arenas to the OS after the exporter drops its buffers.
+
+    ``torch.onnx`` holds a second copy of every parameter while serializing.
+    Freeing it leaves the arenas resident, so a ~70 GB checkpoint stays near the
+    OOM limit through the post-export passes. ``malloc_trim`` hands the free
+    arena pages back to the kernel; it is a no-op on non-glibc platforms.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _save_graph_protobuf(model: "onnx.ModelProto", onnx_path: str) -> None:
+    """Rewrite only the graph protobuf, leaving external weight shards intact.
+
+    ``onnx.save_model`` re-reads every external tensor into ``raw_data`` and
+    rewrites the whole ``.data`` sidecar. For a 70 GB checkpoint that doubles
+    the resident weight footprint and OOMs while the exported PyTorch model is
+    still alive. The passes that call this helper only edit node attributes and
+    value_info metadata, so serializing the protobuf in place is equivalent and
+    keeps the sidecar byte-identical.
+    """
+    with open(onnx_path, "wb") as handle:
+        handle.write(model.SerializeToString())
+
+
 def _strip_onnxscript_internal_attrs(onnx_path: str) -> None:
     """Remove ``_outputs`` attributes injected by onnxscript multi-output ops.
 
@@ -471,15 +484,7 @@ def _strip_onnxscript_internal_attrs(onnx_path: str) -> None:
     if not stripped:
         return
     logger.info("TRT fix: stripped %d internal onnxscript attr(s)", stripped)
-    data_file = os.path.basename(onnx_path) + ".data"
-    onnx.save_model(
-        model,
-        onnx_path,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=data_file,
-        size_threshold=0,
-    )
+    _save_graph_protobuf(model, onnx_path)
 
 
 def _dedup_shared_dql_scales(model) -> int:
@@ -1160,6 +1165,7 @@ def _export_model(
         os.fsync(_f.fileno())
     del prog
     gc.collect()
+    _release_freed_heap()
     nvfp4 = model.config.quant.uses_nvfp4_weights
     mxfp8 = model.config.quant.uses_mxfp8_weights
     if nvfp4:

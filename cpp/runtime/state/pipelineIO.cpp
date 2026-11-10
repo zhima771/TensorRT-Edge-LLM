@@ -167,7 +167,9 @@ void PipelineIO::uploadRaggedMetadata(RaggedExecutionBatch const& batch, cudaStr
     {
         check::check(pleEmbeds.reshape({tokens, pleEmbedDim}), "Qwen4 PLE embedding reshape failed");
     }
-    if (!qsaKVCacheStartIndex.isEmpty())
+    // isEmpty() reports zero volume, which is exactly the prefill shape, so test the
+    // allocation instead to keep reshaping on every step.
+    if (qsaKVCacheStartIndex.getMemoryCapacity() > 0)
     {
         // QSA mode is selected by this binding's runtime extent: [0] = context
         // prefill, [B] = single-token decode. Mixed steps are not supported.
@@ -204,7 +206,7 @@ void PipelineIO::uploadRaggedMetadata(RaggedExecutionBatch const& batch, cudaStr
     upload(attentionSequenceLengths, hostAttentionSequenceLengths);
     upload(stateIndices, hostStateIndices);
     upload(logitsIndices, hostLogitsIndices);
-    if (!qsaKVCacheStartIndex.isEmpty() && batch.shape.numContextSequences == 0)
+    if (qsaKVCacheStartIndex.getMemoryCapacity() > 0 && batch.shape.numContextSequences == 0)
     {
         // Decode only uses the extent as a mode selector, but mirror the past lengths so the values
         // stay meaningful for debugger inspection.
@@ -486,7 +488,7 @@ static void buildTensorMapImpl(
         map.set(binding_names::kPleConvState, io.pleConvState);
         map.set(binding_names::kPresentPleConvState, io.pleConvStateOut);
     }
-    if (!io.qsaRopeTable.isEmpty())
+    if (io.qsaRopeTable.getMemoryCapacity() > 0)
     {
         map.set(binding_names::kQsaRopeTable, io.qsaRopeTable);
         map.set(binding_names::kKVCacheStartIndex, io.qsaKVCacheStartIndex);

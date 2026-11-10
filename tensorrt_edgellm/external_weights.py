@@ -175,7 +175,8 @@ def _find_int4_moe_weight_initializers(onnx_model) -> "list[str]":
 def _find_nvfp4_moe_weight_initializers(onnx_model) -> "list[str]":
     """Return NVFP4 MoE plugin initializer inputs."""
     initializers = {init.name for init in onnx_model.graph.initializer}
-    plugin_op_types = {"Nvfp4MoePlugin", "NvFP4MoEPluginGeforce"}
+    plugin_op_types = {"Nvfp4MoePlugin", "Nvfp4A16MoePlugin",
+                       "NvFP4MoEPluginGeforce"}
 
     external_names: list[str] = []
     external_name_set: set[str] = set()
@@ -364,6 +365,8 @@ def _safetensors_dtype(init) -> str:
         onnx.TensorProto.BFLOAT16: "BF16",
         onnx.TensorProto.FLOAT: "F32",
         onnx.TensorProto.DOUBLE: "F64",
+        onnx.TensorProto.FLOAT8E4M3FN: "F8_E4M3",
+        onnx.TensorProto.FLOAT8E5M2: "F8_E5M2",
     }
     return dtype_map.get(init.data_type, "")
 

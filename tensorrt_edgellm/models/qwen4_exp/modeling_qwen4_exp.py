@@ -770,6 +770,13 @@ class Qwen4ExpCausalLM(nn.Module):
 
     RECURRENT_STATE_DTYPE = torch.float32
     CONV_STATE_DTYPE = torch.float16
+    # The delta-form norms feed a "(1 + w)" Add against an FP32 scalar, so the
+    # post-export FP32->FP16 initializer downgrade must skip them; a mixed-type
+    # Add is rejected by TensorRT.
+    preserve_fp32_initializer_patterns = (".hc_norm.weight",
+                                          ".ple.norm_key.weight",
+                                          ".ple.norm_query.weight",
+                                          ".ple.norm_conv.weight")
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -787,6 +794,13 @@ class Qwen4ExpCausalLM(nn.Module):
             attn = getattr(layer, "self_attn", None)
             if attn is not None:
                 attn.cache_export_gammas()
+        # The checkpoint stores the delta-form norm weights in FP16 and the
+        # loader assigns them verbatim. ``(1 + w)`` then folds the FP16
+        # initializer against an FP32 scalar, which TensorRT rejects as a
+        # type-mismatched Add, so pin the norms to FP32 for the graph.
+        for module in self.modules():
+            if isinstance(module, GroupedRMSNorm):
+                module.weight.data = module.weight.data.float()
 
     def materialize_checkpoint_defaults(self, device: str) -> None:
         """Fill buffers a checkpoint omits (GDN conv bias) under meta init."""
