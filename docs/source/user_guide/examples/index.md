@@ -34,6 +34,8 @@ serving, engine building, ONNX export, and model preparation.
 - [Phi-4 Multimodal](phi4.md): merge the vision LoRA adapter before quantization and export
 - [Speculative Decoding](speculative-decoding.md): MTP, EAGLE3, DFlash, DSpark,
   and JetSpec acceleration
+- [Qwen3.8-Flash-Next on Jetson Thor](qwen3_8_flash_next.md): GDN + QSA hybrid
+  MoE deployment with the NVFP4 checkpoint, including the export workarounds
 - [ASR](asr.md): audio to transcript text with Qwen3-ASR
 - [Nemotron-3.5-ASR](../../developer_guide/models/nemotron3_5_asr.md): audio to transcript text with a model-specific RNN-T runtime
 
